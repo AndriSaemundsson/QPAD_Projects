@@ -1,8 +1,3 @@
-// ============================================================
-// WiFiBasics.ino (Reduced + Disconnect/Reconnect Action) - FIXED
-// (Adds missing drawScrollArrows declaration/definition)
-// ============================================================
-
 #include <stdint.h>
 #include <Wire.h>
 #include <WiFi.h>
@@ -29,7 +24,7 @@ static const uint8_t OLED_ADDRS[] = { 0x3C, 0x3D };
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 
 // ---------------- Timing / Layout ----------------
-#define DEBOUNCE_MS 18
+#define DEBOUNCE_MS     18
 #define CONTENT_TOP_Y   12
 #define FOOTER_LINE_Y   53
 #define FOOTER_TEXT_Y   55
@@ -39,9 +34,12 @@ static const uint32_t SPLASH_MS = 10000;
 typedef uint8_t Screen;
 enum : uint8_t {
   SCR_SPLASH = 0,
+  SCR_SCAN_ANIM,
+  SCR_FOUND_SAVED,
   SCR_MAIN,
+  SCR_CONNECT_MENU,
+  SCR_DISCONNECT_MENU,
   SCR_SAVED_PROMPT,
-  SCR_SCAN,
   SCR_LIST,
   SCR_PASS,
   SCR_CONNECT,
@@ -82,12 +80,17 @@ static String savedPass;
 static bool timeSynced = false;
 
 // ---------------- Main menu ----------------
-static uint8_t mainSel = 0; // 0..2
+// 0 = WiFi Status (top), 1 = Connect/Disconnect (bottom)
+static uint8_t mainSel = 0;
+
+// ---------------- Submenus ----------------
+static uint8_t connMenuSel = 0; // 0..1
+static uint8_t discMenuSel = 0; // 0..1
 
 // ---------------- Message screen ----------------
 static char msgTitle[18] = "Message";
-static char msg1[22] = "";
-static char msg2[22] = "";
+static char msg1[64] = "";
+static char msg2[64] = "";
 static Screen msgReturn = SCR_MAIN;
 static uint32_t msgUntilMs = 0;
 static bool msgTimed = false;
@@ -111,20 +114,80 @@ static bool connStarted = false;
 
 // ---------------- Password editor ----------------
 static const char* CHARSET =
-  " ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
-  "._-@!#$%&*+?/=:;,";
+  " !\"#$%&'()*+,-./"
+  "0123456789"
+  ":;<=>?@"
+  "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+  "[\\]^_`"
+  "abcdefghijklmnopqrstuvwxyz"
+  "{|}~";
 static char passBuf[33] = {0};
 static uint8_t passLen = 0;
 static uint8_t passCur = 0;
 
-// ============================================================
-// Forward declarations (FIX)
-// ============================================================
-static void drawScrollArrows(bool up, bool down);
+// ---------------- Scan animation state ----------------
+static uint32_t scanAnimStartMs = 0;
+static bool savedFoundInScan = false;
 
-// ============================================================
-// Helpers
-// ============================================================
+// Scan-complete gating (wait for A)
+static bool scanCompleteHold = false;
+static int  scanFoundCount = 0;
+static Screen scanNextScreen = SCR_LIST;
+
+// ---------------- Forward declarations ----------------
+static void drawScrollArrows(bool up, bool down);
+static void drawWifiLogoUniversal(uint8_t level);
+
+static void drawCharShiftMarquee(int16_t x, int16_t y, int16_t w, const String& text,
+                                 uint16_t msPerChar, uint16_t pauseMs);
+static void drawTextAuto(int16_t x, int16_t y, int16_t w, const String& text);
+static void drawLabelAndAuto(int16_t xLabel, int16_t y, const char* label,
+                             int16_t xText, int16_t wText, const String& text);
+
+static void drawCharShiftMarqueeColors(int16_t x, int16_t y, int16_t w,
+                                       const String& text,
+                                       uint16_t msPerChar, uint16_t pauseMs,
+                                       uint16_t fg, uint16_t bg);
+
+static void tickSplash();
+static void renderSplash();
+
+static void startScan();
+static void tickScanAnim();
+static void renderScanAnim();
+
+static void tickFoundSaved();
+static void renderFoundSaved();
+
+static void tickMain();
+static void renderMain();
+
+static void tickConnectMenu();
+static void renderConnectMenu();
+
+static void tickDisconnectMenu();
+static void renderDisconnectMenu();
+
+static void tickSavedPrompt();
+static void renderSavedPrompt();
+
+static void tickList();
+static void renderList();
+
+static void tickPass();
+static void renderPass();
+
+static void startConnect();
+static void tickConnect();
+static void renderConnect();
+
+static void tickStatus();
+static void renderStatus();
+
+static void tickMsg();
+static void renderMsg();
+
+// ---------------- Low-level helpers ----------------
 static bool initOled() {
   Wire.begin(I2C_SDA, I2C_SCL);
   Wire.setClock(400000);
@@ -134,6 +197,7 @@ static bool initOled() {
       display.clearDisplay();
       display.setTextSize(1);
       display.setTextColor(SSD1306_WHITE);
+      display.setTextWrap(false);
       display.display();
       return true;
     }
@@ -183,6 +247,7 @@ static void headerSmart(const char* title) {
 
   display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
+
   display.setCursor(0, 0);
   display.print(title);
 
@@ -198,8 +263,10 @@ static void headerSmart(const char* title) {
 static void showMsg(const char* title, const char* l1, const char* l2, uint16_t ms, Screen ret) {
   strncpy(msgTitle, title ? title : "Message", sizeof(msgTitle) - 1);
   msgTitle[sizeof(msgTitle) - 1] = 0;
+
   strncpy(msg1, l1 ? l1 : "", sizeof(msg1) - 1);
   msg1[sizeof(msg1) - 1] = 0;
+
   strncpy(msg2, l2 ? l2 : "", sizeof(msg2) - 1);
   msg2[sizeof(msg2) - 1] = 0;
 
@@ -228,6 +295,20 @@ static void saveWifiCreds(const String& ssid, const String& pass) {
   haveSaved = savedSsid.length() > 0;
 }
 
+static void forgetWifiCreds() {
+  WiFi.disconnect(true, true);
+  timeSynced = false;
+
+  prefs.begin("wifibasics", false);
+  prefs.remove("ssid");
+  prefs.remove("pass");
+  prefs.end();
+
+  savedSsid = "";
+  savedPass = "";
+  haveSaved = false;
+}
+
 static bool syncTimeNtp() {
   if (WiFi.status() != WL_CONNECTED) return false;
   configTime(0, 0, "pool.ntp.org", "time.google.com", "time.cloudflare.com");
@@ -244,18 +325,113 @@ static void doDisconnect() {
   timeSynced = false;
 }
 
-// ============================================================
-// FIX: drawScrollArrows definition
-// ============================================================
+// ---------------- UI helpers ----------------
 static void drawScrollArrows(bool up, bool down) {
   int16_t x = 123;
   if (up)   display.drawTriangle(x, 12, x + 4, 12, x + 2, 9,  SSD1306_WHITE);
   if (down) display.drawTriangle(x, 58, x + 4, 58, x + 2, 61, SSD1306_WHITE);
 }
 
-// ============================================================
-// Password editor helpers
-// ============================================================
+static void drawWifiLogoUniversal(uint8_t level) {
+  const int16_t cx = 64;
+  const int16_t cy = 34;
+  const int16_t dotR = 4;
+
+  auto drawTopRingArc = [&](int16_t R, int16_t thickness) {
+    display.fillCircle(cx, cy, R, SSD1306_WHITE);
+    display.fillCircle(cx, cy, R - thickness, SSD1306_BLACK);
+    display.fillRect(cx - R - 3, cy, (2 * R) + 7, R + 10, SSD1306_BLACK);
+  };
+
+  if (level >= 3) drawTopRingArc(22, 4);
+  if (level >= 2) drawTopRingArc(16, 3);
+  if (level >= 1) drawTopRingArc(10, 3);
+
+  display.fillCircle(cx, cy, dotR, SSD1306_WHITE);
+}
+
+static void drawCharShiftMarquee(int16_t x, int16_t y, int16_t w, const String& text,
+                                 uint16_t msPerChar, uint16_t pauseMs) {
+  display.fillRect(x, y, w, 8, SSD1306_BLACK);
+
+  int16_t winChars = w / 6;
+  if (winChars <= 0) return;
+
+  int16_t len = (int16_t)text.length();
+  if (len <= winChars) {
+    display.setCursor(x, y);
+    display.print(text);
+    return;
+  }
+
+  int16_t maxStart = len - winChars;
+  uint32_t scrollMs = (uint32_t)maxStart * (uint32_t)msPerChar;
+  uint32_t cycleMs  = (uint32_t)pauseMs + scrollMs + (uint32_t)pauseMs;
+
+  uint32_t t = millis() % cycleMs;
+
+  int16_t startIdx = 0;
+  if (t < pauseMs) startIdx = 0;
+  else if (t < pauseMs + scrollMs) startIdx = (int16_t)min((uint32_t)maxStart, (t - pauseMs) / msPerChar);
+  else startIdx = maxStart;
+
+  String view = text.substring(startIdx, startIdx + winChars);
+
+  display.setCursor(x, y);
+  display.print(view);
+}
+
+static void drawTextAuto(int16_t x, int16_t y, int16_t w, const String& text) {
+  drawCharShiftMarquee(x, y, w, text, 260, 1000);
+}
+
+static void drawLabelAndAuto(int16_t xLabel, int16_t y, const char* label,
+                             int16_t xText, int16_t wText, const String& text) {
+  display.setCursor(xLabel, y);
+  display.print(label);
+  drawTextAuto(xText, y, wText, text);
+}
+
+static void drawCharShiftMarqueeColors(int16_t x, int16_t y, int16_t w,
+                                       const String& text,
+                                       uint16_t msPerChar, uint16_t pauseMs,
+                                       uint16_t fg, uint16_t bg) {
+  int16_t winChars = w / 6;
+  if (winChars <= 0) return;
+
+  int16_t len = (int16_t)text.length();
+  String view;
+
+  if (len <= winChars) {
+    view = text;
+  } else {
+    int16_t maxStart = len - winChars;
+    uint32_t scrollMs = (uint32_t)maxStart * (uint32_t)msPerChar;
+    uint32_t cycleMs  = (uint32_t)pauseMs + scrollMs + (uint32_t)pauseMs;
+
+    uint32_t t = millis() % cycleMs;
+
+    int16_t startIdx = 0;
+    if (t < pauseMs) startIdx = 0;
+    else if (t < pauseMs + scrollMs) startIdx = (int16_t)min((uint32_t)maxStart, (t - pauseMs) / msPerChar);
+    else startIdx = maxStart;
+
+    view = text.substring(startIdx, startIdx + winChars);
+  }
+
+  if ((int)view.length() < winChars) {
+    String padded = view;
+    while ((int)padded.length() < winChars) padded += ' ';
+    view = padded;
+  }
+
+  display.setTextColor(fg, bg);
+  display.setCursor(x, y);
+  display.print(view);
+  display.setTextColor(SSD1306_WHITE);
+}
+
+// ---------------- Password editor helpers ----------------
 static int charsetIndex(char c) {
   const char* p = strchr(CHARSET, c);
   return p ? (int)(p - CHARSET) : 0;
@@ -287,13 +463,11 @@ static void backspace() {
   if (passLen == 0) passCur = 0;
 }
 
-// ============================================================
-// Screen: Splash
-// ============================================================
+// ---------------- Screen: Splash ----------------
 static void tickSplash() {
   if (splashStart == 0) splashStart = millis();
-  if (anyButtonPressed()) { screen = SCR_MAIN; return; }
-  if (millis() - splashStart >= SPLASH_MS) { screen = SCR_MAIN; return; }
+  if (anyButtonPressed()) { scanStarted = false; screen = SCR_SCAN_ANIM; return; }
+  if (millis() - splashStart >= SPLASH_MS) { scanStarted = false; screen = SCR_SCAN_ANIM; return; }
 }
 
 static void renderSplash() {
@@ -310,113 +484,30 @@ static void renderSplash() {
   display.display();
 }
 
-// ============================================================
-// Screen: Main (3 items)
-// ============================================================
-static void drawMainRow(uint8_t row, const char* text, bool sel) {
-  const int16_t rowH = 13;
-  const int16_t y = CONTENT_TOP_Y + row * rowH;
-
-  if (sel) display.fillRoundRect(0, y, 128, rowH, 2, SSD1306_WHITE);
-  display.setTextColor(sel ? SSD1306_BLACK : SSD1306_WHITE);
-  display.setCursor(2, y + 2);
-  display.print(text);
-  display.setTextColor(SSD1306_WHITE);
-}
-
-static void mainActionLabel(char out[22]) {
-  bool connected = (WiFi.status() == WL_CONNECTED);
-  if (connected)      strncpy(out, "Disconnect WiFi:", 21);
-  else if (haveSaved) strncpy(out, "Reconnect Saved:", 21);
-  else                strncpy(out, "Scan Networks:", 21);
-  out[21] = 0;
-}
-
-static void tickMain() {
-  if (btnPressed(BID_UP))   mainSel = (mainSel == 0) ? 2 : (mainSel - 1);
-  if (btnPressed(BID_DOWN)) mainSel = (mainSel + 1) % 3;
-
-  if (btnPressed(BID_A)) {
-    if (mainSel == 0) {
-      if (haveSaved) screen = SCR_SAVED_PROMPT;
-      else          screen = SCR_SCAN;
-    } else if (mainSel == 1) {
-      screen = SCR_STATUS;
-    } else {
-      if (WiFi.status() == WL_CONNECTED) {
-        doDisconnect();
-        showMsg("WiFi", "Disconnected", "", 900, SCR_MAIN);
-      } else if (haveSaved) {
-        screen = SCR_SAVED_PROMPT; // still asks first
-      } else {
-        screen = SCR_SCAN;
-      }
-    }
-  }
-}
-
-static void renderMain() {
-  display.clearDisplay();
-  headerSmart("Network");
-
-  char action[22];
-  mainActionLabel(action);
-
-  drawMainRow(0, "Connect to WiFi:", mainSel == 0);
-  drawMainRow(1, "WiFi Status:",     mainSel == 1);
-  drawMainRow(2, action,             mainSel == 2);
-
-  footerBar("UP/DN  A:Select");
-  display.display();
-}
-
-// ============================================================
-// Screen: Saved prompt
-// ============================================================
-static void tickSavedPrompt() {
-  if (!haveSaved) { screen = SCR_SCAN; return; }
-
-  if (btnPressed(BID_A)) {
-    selSsid = savedSsid;
-    selAuth = savedPass.length() ? WIFI_AUTH_WPA2_PSK : WIFI_AUTH_OPEN;
-
-    memset(passBuf, 0, sizeof(passBuf));
-    strncpy(passBuf, savedPass.c_str(), sizeof(passBuf) - 1);
-    passLen = (uint8_t)min((size_t)strlen(passBuf), sizeof(passBuf) - 1);
-    passCur = passLen ? (passLen - 1) : 0;
-
-    screen = SCR_CONNECT;
-  }
-  if (btnPressed(BID_B)) screen = SCR_SCAN;
-}
-
-static void renderSavedPrompt() {
-  display.clearDisplay();
-  headerSmart("Connect");
-
-  display.setCursor(0, 16);
-  display.print("Saved WiFi found:");
-  display.setCursor(0, 30);
-  String s = savedSsid;
-  if (s.length() > 20) s = s.substring(0, 20);
-  display.print(s);
-
-  footerBar("A:Connect  B:Scan");
-  display.display();
-}
-
-// ============================================================
-// Screen: Scan
-// ============================================================
+// ---------------- Scan workflow ----------------
 static void startScan() {
   apCount = 0; apSel = 0; apScroll = 0;
   scanStarted = true;
+  savedFoundInScan = false;
+
+  scanCompleteHold = false;
+  scanFoundCount = 0;
+  scanNextScreen = SCR_LIST;
+
+  scanAnimStartMs = millis();
+
   WiFi.mode(WIFI_STA);
   WiFi.scanDelete();
   WiFi.scanNetworks(true, false);
 }
 
-static void tickScan() {
+static void tickScanAnim() {
+  if (scanCompleteHold) {
+    if (btnPressed(BID_A)) screen = scanNextScreen;
+    if (btnPressed(BID_B)) screen = SCR_MAIN;
+    return;
+  }
+
   if (!scanStarted) startScan();
 
   int n = WiFi.scanComplete();
@@ -435,6 +526,8 @@ static void tickScan() {
     return;
   }
 
+  scanFoundCount = n;
+
   apCount = min(n, (int)AP_MAX);
   for (int i = 0; i < apCount; i++) {
     aps[i].ssid = WiFi.SSID(i);
@@ -445,23 +538,220 @@ static void tickScan() {
   WiFi.scanDelete();
   scanStarted = false;
 
-  if (apCount == 0) showMsg("Scan", "No networks", "Back to main", 1200, SCR_MAIN);
-  else screen = SCR_LIST;
+  savedFoundInScan = false;
+  if (apCount > 0 && haveSaved) {
+    for (int i = 0; i < apCount; i++) {
+      if (aps[i].ssid == savedSsid) { savedFoundInScan = true; break; }
+    }
+  }
+
+  if (apCount == 0) scanNextScreen = SCR_MAIN;
+  else              scanNextScreen = savedFoundInScan ? SCR_FOUND_SAVED : SCR_LIST;
+
+  scanCompleteHold = true;
 }
 
-static void renderScan() {
+static void renderScanAnim() {
   display.clearDisplay();
-  headerSmart("Scan");
-  display.setCursor(0, 22);
-  display.print("Scanning networks...");
-  display.drawCircle(118, 30, 3, SSD1306_WHITE);
-  footerBar("B:Cancel");
+  headerSmart("WiFi");
+
+  uint32_t step = (millis() - scanAnimStartMs) / 700;
+  uint8_t level = (uint8_t)(step % 4);
+
+  drawWifiLogoUniversal(scanCompleteHold ? 3 : level);
+
+  if (!scanCompleteHold) {
+    const char* txt = "Scanning...";
+    int16_t x1, y1; uint16_t w, h;
+    display.getTextBounds(txt, 0, 0, &x1, &y1, &w, &h);
+    display.setCursor((128 - (int16_t)w) / 2, 44);
+    display.print(txt);
+    footerBar("B:Cancel");
+  } else {
+    char buf[24];
+    snprintf(buf, sizeof(buf), "%d networks found", scanFoundCount);
+    int16_t x1, y1; uint16_t w, h;
+    display.getTextBounds(buf, 0, 0, &x1, &y1, &w, &h);
+    display.setCursor((128 - (int16_t)w) / 2, 44);
+    display.print(buf);
+    footerBar("A:Continue  B:Back");
+  }
+
   display.display();
 }
 
-// ============================================================
-// Screen: List
-// ============================================================
+// ---------------- Screen: Found Saved ----------------
+static void tickFoundSaved() {
+  if (!haveSaved || !savedFoundInScan) { screen = SCR_LIST; return; }
+
+  if (btnPressed(BID_A)) {
+    selSsid = savedSsid;
+    selAuth = savedPass.length() ? WIFI_AUTH_WPA2_PSK : WIFI_AUTH_OPEN;
+
+    memset(passBuf, 0, sizeof(passBuf));
+    strncpy(passBuf, savedPass.c_str(), sizeof(passBuf) - 1);
+    passLen = (uint8_t)min((size_t)strlen(passBuf), sizeof(passBuf) - 1);
+    passCur = passLen ? (passLen - 1) : 0;
+
+    screen = SCR_CONNECT;
+  }
+  if (btnPressed(BID_B)) screen = SCR_LIST;
+}
+
+static void renderFoundSaved() {
+  display.clearDisplay();
+  headerSmart("Found Saved");
+
+  display.setCursor(0, 18);
+  display.print("Saved network:");
+
+  drawTextAuto(0, 32, 128, savedSsid);
+
+  footerBar("A:Connect  B:List");
+  display.display();
+}
+
+// ---------------- Screen: Main menu ----------------
+static void drawMenuRow(uint8_t row, const char* text, bool sel) {
+  const int16_t rowH = 13;
+  const int16_t y = CONTENT_TOP_Y + row * rowH;
+
+  if (sel) display.fillRoundRect(0, y, 128, rowH, 2, SSD1306_WHITE);
+  display.setTextColor(sel ? SSD1306_BLACK : SSD1306_WHITE);
+  display.setCursor(2, y + 2);
+  display.print(text);
+  display.setTextColor(SSD1306_WHITE);
+}
+
+static void tickMain() {
+  if (btnPressed(BID_UP))   mainSel = (mainSel == 0) ? 1 : 0;
+  if (btnPressed(BID_DOWN)) mainSel = (mainSel == 1) ? 0 : 1;
+
+  if (btnPressed(BID_A)) {
+    bool connected = (WiFi.status() == WL_CONNECTED);
+
+    if (mainSel == 0) {
+      screen = SCR_STATUS;
+    } else {
+      if (connected) { discMenuSel = 0; screen = SCR_DISCONNECT_MENU; }
+      else           { connMenuSel = 0; screen = SCR_CONNECT_MENU; }
+    }
+  }
+}
+
+static void renderMain() {
+  display.clearDisplay();
+  headerSmart("Network");
+
+  bool connected = (WiFi.status() == WL_CONNECTED);
+
+  drawMenuRow(0, "WiFi Status",                         mainSel == 0);
+  drawMenuRow(1, connected ? "Disconnect" : "Connect",  mainSel == 1);
+
+  footerBar("UP/DN  A:Select");
+  display.display();
+}
+
+// ---------------- Screen: Connect submenu ----------------
+static void tickConnectMenu() {
+  if (btnPressed(BID_UP))   connMenuSel = (connMenuSel == 0) ? 1 : 0;
+  if (btnPressed(BID_DOWN)) connMenuSel = (connMenuSel == 1) ? 0 : 1;
+
+  if (btnPressed(BID_B)) { screen = SCR_MAIN; return; }
+
+  if (btnPressed(BID_A)) {
+    if (connMenuSel == 0) {
+      scanStarted = false;
+      screen = SCR_SCAN_ANIM;
+    } else {
+      if (!haveSaved) {
+        showMsg("WiFi", "No saved network", "", 1000, SCR_CONNECT_MENU);
+        return;
+      }
+      selSsid = savedSsid;
+      selAuth = savedPass.length() ? WIFI_AUTH_WPA2_PSK : WIFI_AUTH_OPEN;
+
+      memset(passBuf, 0, sizeof(passBuf));
+      strncpy(passBuf, savedPass.c_str(), sizeof(passBuf) - 1);
+      passLen = (uint8_t)min((size_t)strlen(passBuf), sizeof(passBuf) - 1);
+      passCur = passLen ? (passLen - 1) : 0;
+
+      screen = SCR_CONNECT;
+    }
+  }
+}
+
+static void renderConnectMenu() {
+  display.clearDisplay();
+  headerSmart("Connect");
+
+  drawMenuRow(0, "Scan", connMenuSel == 0);
+  drawMenuRow(1, haveSaved ? "Connect to saved" : "Connect to saved (none)", connMenuSel == 1);
+
+  footerBar("UP/DN  A:Select  B:Back");
+  display.display();
+}
+
+// ---------------- Screen: Disconnect submenu ----------------
+static void tickDisconnectMenu() {
+  if (btnPressed(BID_UP))   discMenuSel = (discMenuSel == 0) ? 1 : 0;
+  if (btnPressed(BID_DOWN)) discMenuSel = (discMenuSel == 1) ? 0 : 1;
+
+  if (btnPressed(BID_B)) { screen = SCR_MAIN; return; }
+
+  if (btnPressed(BID_A)) {
+    if (discMenuSel == 0) {
+      doDisconnect();
+      showMsg("WiFi", "Disconnected", "", 900, SCR_MAIN);
+    } else {
+      forgetWifiCreds();
+      showMsg("WiFi", "Disconnected", "Saved WiFi forgotten", 1100, SCR_MAIN);
+    }
+  }
+}
+
+static void renderDisconnectMenu() {
+  display.clearDisplay();
+  headerSmart("Disconnect");
+
+  drawMenuRow(0, "Disconnect",          discMenuSel == 0);
+  drawMenuRow(1, "Disconnect & Forget", discMenuSel == 1);
+
+  footerBar("UP/DN  A:Select  B:Back");
+  display.display();
+}
+
+// ---------------- Screen: Saved prompt (compatibility) ----------------
+static void tickSavedPrompt() {
+  if (!haveSaved) { scanStarted = false; screen = SCR_SCAN_ANIM; return; }
+
+  if (btnPressed(BID_A)) {
+    selSsid = savedSsid;
+    selAuth = savedPass.length() ? WIFI_AUTH_WPA2_PSK : WIFI_AUTH_OPEN;
+
+    memset(passBuf, 0, sizeof(passBuf));
+    strncpy(passBuf, savedPass.c_str(), sizeof(passBuf) - 1);
+    passLen = (uint8_t)min((size_t)strlen(passBuf), sizeof(passBuf) - 1);
+    passCur = passLen ? (passLen - 1) : 0;
+
+    screen = SCR_CONNECT;
+  }
+  if (btnPressed(BID_B)) { scanStarted = false; screen = SCR_SCAN_ANIM; }
+}
+
+static void renderSavedPrompt() {
+  display.clearDisplay();
+  headerSmart("Connect");
+
+  display.setCursor(0, 16);
+  display.print("Saved WiFi found:");
+  drawTextAuto(0, 30, 128, savedSsid);
+
+  footerBar("A:Connect  B:Scan");
+  display.display();
+}
+
+// ---------------- Screen: Networks list ----------------
 static void tickList() {
   if (btnPressed(BID_UP))   { if (apSel > 0) apSel--; }
   if (btnPressed(BID_DOWN)) { if (apSel + 1 < apCount) apSel++; }
@@ -485,7 +775,10 @@ static void tickList() {
         passLen = (uint8_t)min((size_t)strlen(passBuf), sizeof(passBuf) - 1);
         passCur = passLen ? (passLen - 1) : 0;
       } else {
-        passBuf[0] = 'a'; passBuf[1] = 0; passLen = 1; passCur = 0;
+        passBuf[0] = 'a';
+        passBuf[1] = 0;
+        passLen = 1;
+        passCur = 0;
       }
       screen = SCR_PASS;
     }
@@ -510,18 +803,22 @@ static void renderList() {
     bool sel = (idx == apSel);
 
     if (sel) display.fillRoundRect(0, y, 128, rowH, 2, SSD1306_WHITE);
-    display.setTextColor(sel ? SSD1306_BLACK : SSD1306_WHITE);
 
     String s = aps[idx].ssid;
     if (s.length() == 0) s = "<hidden>";
-    if (s.length() > 15) s = s.substring(0, 15);
 
-    display.setCursor(2, y + 2);
-    display.print(s);
+    const int16_t xText = 2;
+    const int16_t yText = y + 2;
+    const int16_t wText = 106;
 
+    uint16_t fg = sel ? SSD1306_BLACK : SSD1306_WHITE;
+    uint16_t bg = sel ? SSD1306_WHITE : SSD1306_BLACK;
+
+    drawCharShiftMarqueeColors(xText, yText, wText, s, 260, 1000, fg, bg);
+
+    display.setTextColor(sel ? SSD1306_BLACK : SSD1306_WHITE);
     display.setCursor(110, y + 2);
     display.print((aps[idx].auth == WIFI_AUTH_OPEN) ? "O" : "L");
-
     display.setTextColor(SSD1306_WHITE);
   }
 
@@ -530,9 +827,7 @@ static void renderList() {
   display.display();
 }
 
-// ============================================================
-// Screen: Password
-// ============================================================
+// ---------------- Screen: Password editor ----------------
 static void tickPass() {
   if (btnPressed(BID_LEFT))  { if (passLen) passCur = (passCur ? passCur - 1 : 0); }
   if (btnPressed(BID_RIGHT)) { if (passLen) passCur = (passCur + 1 < passLen ? passCur + 1 : passCur); }
@@ -560,15 +855,18 @@ static void renderPass() {
   display.clearDisplay();
   headerSmart("Password");
 
-  display.setCursor(0, 14);
-  display.print("SSID:");
-  String s = selSsid;
-  if (s.length() > 20) s = s.substring(0, 20);
-  display.setCursor(30, 14);
-  display.print(s);
+  if (selSsid.length() > 0) {
+    drawLabelAndAuto(0, 14, "SSID:", 30, 98, selSsid);
+  } else {
+    display.setCursor(0, 14);
+    display.print("SSID:");
+    display.setCursor(30, 14);
+    display.print("-");
+  }
 
   display.setCursor(0, 30);
   display.print("PWD:");
+
   const uint8_t win = 16;
   uint8_t start = 0;
   if (passLen > win && passCur >= win) start = passCur - (win - 1);
@@ -585,9 +883,7 @@ static void renderPass() {
   display.display();
 }
 
-// ============================================================
-// Screen: Connect
-// ============================================================
+// ---------------- Screen: Connect ----------------
 static void startConnect() {
   connStarted = true;
   connStartMs = millis();
@@ -634,24 +930,31 @@ static void renderConnect() {
   display.clearDisplay();
   headerSmart("Connecting");
 
-  display.setCursor(0, 18);
-  display.print("SSID:");
-  String s = selSsid;
-  if (s.length() > 20) s = s.substring(0, 20);
-  display.setCursor(30, 18);
-  display.print(s);
+  if (selSsid.length() > 0) {
+    drawLabelAndAuto(0, 18, "SSID:", 30, 98, selSsid);
+  } else {
+    display.setCursor(0, 18);
+    display.print("SSID:");
+    display.setCursor(30, 18);
+    display.print("-");
+  }
 
-  display.setCursor(0, 34);
-  display.print("Trying...");
+  // Animated "Connecting" line: clear a fixed area and redraw each frame.
+  const int16_t y = 34;
+  display.fillRect(0, y, 118, 10, SSD1306_BLACK); // don't erase the spinner at x=118
+  display.setCursor(0, y);
+  display.print("Connecting");
+
+  uint8_t dots = (millis() / 450) % 4; // "", ".", "..", "..."
+  for (uint8_t i = 0; i < dots; i++) display.print('.');
+
   display.drawCircle(118, 34, 3, SSD1306_WHITE);
 
   footerBar("B:Cancel");
   display.display();
 }
 
-// ============================================================
-// Screen: Status
-// ============================================================
+// ---------------- Screen: Status ----------------
 static void tickStatus() {
   if (btnPressed(BID_B)) screen = SCR_MAIN;
 
@@ -673,13 +976,12 @@ static void renderStatus() {
   display.print("WiFi : ");
   display.print(conn ? "Connected" : "Not conn");
 
-  display.setCursor(0, 26);
-  display.print("SSID : ");
   if (conn) {
-    String s = WiFi.SSID();
-    if (s.length() > 16) s = s.substring(0, 16);
-    display.print(s);
-  } else display.print("-");
+    drawLabelAndAuto(0, 26, "SSID : ", 42, 86, WiFi.SSID());
+  } else {
+    display.setCursor(0, 26);
+    display.print("SSID : -");
+  }
 
   display.setCursor(0, 38);
   display.print("IP   : ");
@@ -690,9 +992,7 @@ static void renderStatus() {
   display.display();
 }
 
-// ============================================================
-// Screen: Msg
-// ============================================================
+// ---------------- Screen: Message ----------------
 static void tickMsg() {
   if (msgTimed && millis() >= msgUntilMs) { screen = msgReturn; return; }
   if (btnPressed(BID_A) || btnPressed(BID_B)) screen = msgReturn;
@@ -701,15 +1001,15 @@ static void tickMsg() {
 static void renderMsg() {
   display.clearDisplay();
   headerSmart(msgTitle);
-  display.setCursor(0, 18); display.print(msg1);
-  display.setCursor(0, 32); display.print(msg2);
+
+  drawTextAuto(0, 18, 128, String(msg1));
+  drawTextAuto(0, 32, 128, String(msg2));
+
   footerBar("A/B:OK");
   display.display();
 }
 
-// ============================================================
-// Arduino setup/loop
-// ============================================================
+// ---------------- Arduino setup/loop ----------------
 void setup() {
   pinMode(BTN_UP,    INPUT_PULLUP);
   pinMode(BTN_DOWN,  INPUT_PULLUP);
@@ -722,6 +1022,8 @@ void setup() {
   loadPrefs();
 
   splashStart = millis();
+  scanStarted = false;
+  scanCompleteHold = false;
   screen = SCR_SPLASH;
 }
 
@@ -733,15 +1035,18 @@ void loop() {
   updateButtons();
 
   switch (screen) {
-    case SCR_SPLASH:       tickSplash();       renderSplash();       break;
-    case SCR_MAIN:         tickMain();         renderMain();         break;
-    case SCR_SAVED_PROMPT: tickSavedPrompt();  renderSavedPrompt();  break;
-    case SCR_SCAN:         tickScan();         renderScan();         break;
-    case SCR_LIST:         tickList();         renderList();         break;
-    case SCR_PASS:         tickPass();         renderPass();         break;
-    case SCR_CONNECT:      tickConnect();      renderConnect();      break;
-    case SCR_STATUS:       tickStatus();       renderStatus();       break;
-    case SCR_MSG:          tickMsg();          renderMsg();          break;
-    default:               screen = SCR_MAIN;                          break;
+    case SCR_SPLASH:          tickSplash();         renderSplash();         break;
+    case SCR_SCAN_ANIM:       tickScanAnim();       renderScanAnim();       break;
+    case SCR_FOUND_SAVED:     tickFoundSaved();     renderFoundSaved();     break;
+    case SCR_MAIN:            tickMain();           renderMain();           break;
+    case SCR_CONNECT_MENU:    tickConnectMenu();    renderConnectMenu();    break;
+    case SCR_DISCONNECT_MENU: tickDisconnectMenu(); renderDisconnectMenu(); break;
+    case SCR_SAVED_PROMPT:    tickSavedPrompt();    renderSavedPrompt();    break;
+    case SCR_LIST:            tickList();           renderList();           break;
+    case SCR_PASS:            tickPass();           renderPass();           break;
+    case SCR_CONNECT:         tickConnect();        renderConnect();        break;
+    case SCR_STATUS:          tickStatus();         renderStatus();         break;
+    case SCR_MSG:             tickMsg();            renderMsg();            break;
+    default:                  screen = SCR_MAIN;                              break;
   }
 }
